@@ -1,0 +1,8 @@
+{
+  "name": "optchat",
+  "label": "OptChat",
+  "version": "0.1.0",
+  "description": "Memory engine status: view size, sawtooth merges, background compactions",
+  "icon": "Database",
+  "api": "plugin_api.py"
+}

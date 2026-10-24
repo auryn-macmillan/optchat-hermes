@@ -1,0 +1,10 @@
+name: optchat
+version: 0.1.0
+description: >
+  OptChat / UniiChat memory — one chat that never ends. The whole conversation
+  lives in an append-only log; a cheap model compresses it in the background
+  into a binary tree of 512-byte lines, and every call sees a constant-size
+  self-compacting view (64-128 KB sawtooth, Taelin rollback-push merge order,
+  prompt-cache friendly). Registers zoom/date tools and a Desktop pane.
+  Toggle on/off in Settings -> Plugins; active when context.engine=optchat.
+author: Hermes (implementation) / Victor Taelin (UniiChat design)
