@@ -47,6 +47,15 @@ COMPACT_TARGET = 24_000  # compaction view average size (bytes)
 COMPACT_HIGH = 32_000    # compaction view re-merge trigger (bytes)
 MAX_LINE_TRIES = 5       # too-long correction rounds per line
 
+# Backpressure: the request only shrinks when the summary frontier (`covered`) keeps pace
+# with new entries. If the background builder falls past BACKLOG_TRIGGER entries, a request's
+# recent tail rides verbatim and can grow toward the context limit (the overflow that hit
+# session 20261024_015150_225691dc). The request path then drains the frontier synchronously
+# (bounded by budget/deadline) so the backlog can never grow unbounded.
+BACKLOG_TRIGGER = 40      # entries: catch up once the un-summarized tail exceeds this
+CATCHUP_BUDGET = 48       # entries: max the frontier may lag before a turn blocks on catch-up
+CATCHUP_DEADLINE_S = 20.0  # seconds: upper bound a single turn waits on catch-up
+
 LLMFn = Callable[[Optional[str], List[dict]], str]
 
 # paths whose flock this process already holds (flock is per-fd, not per-process)
@@ -482,6 +491,43 @@ class Store:
             self.save_view()
             self.save_meta()
 
+    def catch_up(self, budget_nodes: int = 0, deadline: Optional[float] = None,
+                 target_backlog: int = 0) -> int:
+        """Synchronously build the level-0 frontier from ``covered`` up to ``T`` (and merge
+        parents), so the summary view covers the whole transcript. Returns level-0 nodes built.
+
+        This is the drain primitive for both the on-demand catch-up command and the per-turn
+        backpressure below. Callers bound it with ``budget_nodes`` / ``deadline`` so a slow or
+        temporarily-down aux model can never hang a turn. A failed build stops the drain early
+        (the background keeps retrying); the backlog then only closes when the aux is healthy —
+        exactly when we want it to. ``target_backlog`` stops early once ``T - covered`` drops to
+        it, so a backpressure caller can leave a small margin instead of rebuilding all history.
+        """
+        if self.read_only or self.llm_fn is None:
+            return 0
+        with self._lock:
+            cap = self.T
+        target_covered = max(0, cap - target_backlog) if target_backlog else cap
+        built = 0
+        while self.covered < target_covered:
+            if budget_nodes and built >= budget_nodes:
+                break
+            if deadline is not None and time.time() > deadline:
+                break
+            had = self.covered
+            self._build(0, self.covered)  # synchronous; advances `covered` on success
+            if self.covered == had:
+                break  # build failed (aux down); background keeps retrying, don't spin
+            built += 1
+        self.batch()
+        self.save_meta()
+        return built
+
+    def backlog(self) -> int:
+        """Un-summarized entries: ``T - covered``. The verbatim tail that still rides the request."""
+        with self._lock:
+            return self.T - self.covered
+
     def render_view(self) -> str:
         with self._lock:
             if self._render_cache and self._render_cache[0] == self.view_version:
@@ -609,3 +655,30 @@ def get_store(session_id: str, home: Path, llm_fn: Optional[LLMFn] = None) -> St
         elif llm_fn is not None:
             store.llm_fn = llm_fn  # keep compactions on the newest module's LLM handle
         return store
+
+
+def drain_backlog(budget_nodes: int = 0, deadline: Optional[float] = None,
+                  target_backlog: int = 0) -> Dict[str, int]:
+    """Once-off catch-up: synchronously drain the un-summarized frontier (``covered`` → ``T``)
+    for every open session, returning ``{session_id: nodes_built}`` (``-1`` = failed).
+
+    Recovers from a missed-compaction backlog (e.g. after the aux model was down and the frontier
+    stalled). A stuck frontier breaks ``catch_up`` on its first failed build, so a down aux cannot
+    make this spin; ``deadline`` bounds the wall-clock when the aux is healthy. Runs in the gateway
+    process (it owns every open store's flock), so a ``/optchat-catchup`` command reaches all chats.
+    """
+    if deadline is None:
+        deadline = time.time() + 180.0
+    out: Dict[str, int] = {}
+    with _STORES_LOCK:
+        items = list(_STORES.items())
+    for sid, store in items:
+        if store.read_only or store.llm_fn is None:
+            continue
+        try:
+            out[sid] = store.catch_up(budget_nodes=budget_nodes, deadline=deadline,
+                                      target_backlog=target_backlog)
+        except Exception as exc:  # noqa: BLE001 — a catch-up must never break the caller
+            logger.warning("optchat catch-up failed for %s: %s", sid, exc)
+            out[sid] = -1
+    return out

@@ -25,7 +25,10 @@ from typing import Any, Dict, List, Optional
 
 from agent.context_engine import ContextEngine
 
-from .core import HIGH_DEFAULT, LOW_DEFAULT, Store, get_store
+from .core import (
+    BACKLOG_TRIGGER, CATCHUP_BUDGET, CATCHUP_DEADLINE_S,
+    HIGH_DEFAULT, LOW_DEFAULT, Store, get_store,
+)
 from .prompt import DATE_DESC, ZOOM_DESC
 
 logger = logging.getLogger(__name__)
@@ -145,6 +148,17 @@ class OptChatEngine(ContextEngine):
             store.ingest(conversation_messages or [])  # also retries a lost lease
             if store.read_only:
                 return None
+            # Backpressure: if the background builder has fallen behind (un-summarized tail
+            # past BACKLOG_TRIGGER), the request's recent messages ride verbatim and can grow
+            # toward the context limit. Drain the frontier synchronously (bounded by budget +
+            # deadline) BEFORE the engage/covered guard below, so a stalled frontier (covered
+            # near 0) is rebuilt rather than short-circuited. The user occasionally waits on
+            # compaction, but the request size stays bounded and the backlog can never grow
+            # unbounded again.
+            if store.backlog() > BACKLOG_TRIGGER and store.llm_fn is not None:
+                store.catch_up(budget_nodes=CATCHUP_BUDGET,
+                               deadline=time.time() + CATCHUP_DEADLINE_S,
+                               target_backlog=max(0, store.T - store.covered - CATCHUP_BUDGET))
             if store.system_prompt is None and request_messages \
                     and request_messages[0].get("role") == "system":
                 sp = request_messages[0].get("content")
